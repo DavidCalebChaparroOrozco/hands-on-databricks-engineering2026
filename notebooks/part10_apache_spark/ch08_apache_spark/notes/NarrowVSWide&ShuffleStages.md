@@ -505,4 +505,3 @@ New stage
 > **Shuffle = data movement that occurs because of a wide dependency**
 > 
 > **Stage = how Spark groups the work around shuffle boundaries**
->
