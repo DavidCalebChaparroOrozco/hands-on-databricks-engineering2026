@@ -1,0 +1,10 @@
+services:
+  spark-lab:
+    build: . 
+    container_name: spark-lab
+    ports:
+    - "8888:8888"   # JupyterLab
+    - "4040:4040"   # Spark UI
+    - "4041:4041"   # Spark UI for a second session
+    volumes:
+    - ./:/lab       # local folder mounted in the container
