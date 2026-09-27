@@ -508,3 +508,4 @@ final result
 ```
 
 > **Salting does not reduce the amount of data. It changes how the data is distributed so that a hot key can be processed by multiple tasks instead of becoming concentrated in one partition.**
+
