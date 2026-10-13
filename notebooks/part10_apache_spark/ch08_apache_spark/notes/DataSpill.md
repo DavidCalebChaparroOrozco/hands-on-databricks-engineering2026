@@ -380,3 +380,297 @@ Key takeaway: Storage memory keeps useful results; execution memory helps Spark 
 
 ---
 
+## Unified Memory
+
+### Why Is It Called “Unified”?
+
+Spark calls it Unified Memory because Execution and Storage share the same memory region instead of having two completely separate, fixed-size pools.
+
+- Execution memory supports computations such as joins, aggregations, and sorting.
+- Storage memory holds cached or persisted data for reuse.
+
+The boundary between them is flexible. Each can use available memory, subject to Spark's allocation and eviction rules.
+
+### 1. Each uses what it needs
+
+Execution and Storage do not automatically receive equal halves of memory. The `spark.memory.storageFraction` setting defines a threshold for protected storage memory; it does not impose a permanent 50/50 split.
+
+If Execution uses little memory, Storage can use more of the available pool. If Storage uses little memory, Execution can use more.
+
+### 2. Storage can borrow unused execution memory
+
+Suppose the unified memory pool is 4 GB, and the storage threshold is 2 GB.
+
+If Execution uses only 0.5 GB, Storage may use some of the remaining memory, including memory beyond its 2 GB threshold.
+
+This is useful when Spark has a large dataset to cache but relatively little active computation.
+
+### 3. Execution can reclaim storage memory
+
+Now imagine a large join needs additional execution memory.
+
+If available memory is insufficient, Spark can evict cached blocks that occupy the reclaimable portion of Storage memory, allowing Execution to use that space.
+
+However, storage blocks within the protected region cannot be evicted simply to satisfy Execution's memory request.
+
+Important: The storage threshold is a protection boundary, not a guarantee that the corresponding amount of memory is always occupied by cached data.
+
+### 4. Storage cannot evict execution memory
+
+The reverse does not work the same way. If Execution is already using memory, Storage cannot evict its active working data to make room for a new cached block.
+
+If a new block cannot obtain sufficient storage memory, it may fail to remain cached in memory. Depending on the persistence level, it may be stored on disk instead.
+
+A running task is not interrupted merely because a new cache entry needs memory.
+
+Key takeaway: Execution can reclaim eligible storage memory, but Storage cannot reclaim memory actively used by Execution.
+
+## A Task Requests Memory: What Does Spark Do?
+
+Consider a simplified example:
+
+- Unified memory pool: 4 GB
+- Storage protection threshold: 2 GB
+- Execution currently uses 1 GB
+- Cached partitions occupy 3 GB
+- Free memory: 0 GB
+- A join requests an additional 2 GB
+
+### Step 1: Starting point
+
+![alt text](../images/UnifiedMemory.png)
+
+All 4 GB are occupied: 1 GB by Execution and 3 GB by cached data.
+
+### Step 2: The join requests another 2 GB
+
+Spark checks whether sufficient execution memory is available. Because the pool is full, it must try to obtain more memory before the operation can continue without spilling.
+
+### Step 3: Spark evicts eligible cached blocks
+
+Storage currently occupies 3 GB, but only 2 GB is within the protected region in this simplified example.
+
+Spark can reclaim up to 1 GB of eligible storage memory, assuming the relevant cached blocks can be evicted.
+
+After reclaiming that 1 GB:
+
+- Execution uses 2 GB.
+- Storage retains 2 GB.
+- Free memory returns to 0 GB.
+
+No spilling is necessarily required yet; Spark has reclaimed 1 GB from Storage.
+
+### Step 4: The protected storage threshold is reached
+
+Execution still needs another 1 GB, but Storage's remaining 2 GB is within the protected region.
+
+Spark cannot simply evict that remaining storage memory to satisfy the request.
+
+### Step 5: The operation may spill to disk
+
+If the join cannot obtain enough execution memory, its algorithm may spill intermediate data to disk. This frees working memory so processing can continue.
+
+### Final memory state
+
+![alt text](../images/FinalMemoryState.png)
+
+One important distinction: Spark's `storageFraction` is not a strict universal limit on how much memory Storage may occupy. It defines the protected storage region used by the unified memory manager. Also, `cache()` does not necessarily move every evicted partition to disk; the actual behavior depends on the persistence level.
+
+Key takeaway: Unified Memory lets Execution and Storage share resources dynamically. When memory becomes scarce, Spark may evict eligible cached blocks first; if Execution still cannot obtain enough memory, an operation may spill intermediate data to disk.
+
+---
+
+## Data Spill and Cache Eviction
+
+### Eviction: What Happens to a Block That Gets Pushed Out?
+
+When Spark needs memory for computation, it may evict cached data to free up space. What happens to an evicted partition depends on its persistence level.
+
+Caching improves performance, but it does not guarantee that Spark will never need to read data from disk or recompute a partition.
+
+### 1. Starting point: Everything fits in Storage
+
+Suppose a DataFrame has three cached partitions: P0, P1, and P2.
+
+```
+df.cache()
+```
+
+For PySpark DataFrames, `cache()` defaults to `MEMORY_AND_DISK_DESER`.
+
+Alternatively:
+
+```
+df.persist(StorageLevel.MEMORY_ONLY)
+```
+
+With either persistence level, suppose all three partitions initially fit in memory.
+
+| Partition | Storage state |
+| --------- | ------------- |
+| P0        | In memory     |
+| P1        | In memory     |
+| P2        | In memory     |
+
+Reading cached partitions from memory is generally much faster than reading them from disk or recomputing them.
+
+### 2. Eviction: Execution needs memory
+
+Suppose a join needs additional execution memory, and Spark evicts cached partition P0 to free up space.
+
+The result depends on the persistence level.
+
+![alt text](../images/Eviction.png)
+
+A technical distinction: Spark's `MEMORY_AND_DISK` persistence level does not necessarily write every evicted block to disk as an immediate eviction operation. Rather, it allows partitions that cannot be retained in memory to be stored on disk. The key difference is whether a usable disk copy is available when the partition is requested again.
+
+### 3. P0 is requested again
+
+Suppose another action needs partition P0.
+
+| Persistence level       | What happens?                                                                | Cost                                                 |
+| ----------------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `MEMORY_AND_DISK_DESER` | Read P0 from disk if its persisted copy is available; otherwise recompute it | Disk I/O, usually without recomputation              |
+| `MEMORY_ONLY`           | Recompute P0 from its lineage                                                | Re-executes the transformations needed to produce P0 |
+
+For example:
+
+```
+filtered = customers.filter("age > 25")filtered.persist(StorageLevel.MEMORY_ONLY)filtered.count()  # Materializes the cachefiltered.groupBy("city").count()
+```
+
+If a cached partition is evicted between these actions, Spark can recompute the missing partition when the second action needs it.
+
+Key takeaway: A cache is a performance optimization, not a permanent guarantee that computed data will remain available in memory.
+
+## The Complete Picture: How Spark Handles Memory Pressure
+
+Spilling is not necessarily the first thing Spark does when execution needs memory. The exact behavior depends on the operation and the type of memory pressure.
+
+A simplified sequence is:
+
+![alt text](../images/SparkMemoryPressureManagement.png)
+
+This sequence is a conceptual model, not a strict universal order. For example, some Spark operators spill their own intermediate data when their data structures grow too large, without first evicting cached blocks.
+
+Also, eviction and spilling are different operations:
+
+- Eviction: Removes cached data from memory to free up space.
+- Spilling: Writes intermediate data from an active computation to disk because it cannot efficiently remain in memory.
+
+If memory pressure cannot be managed through allocation, eviction, or spilling, the task or executor may still fail.
+
+---
+
+## What Is Spilling?
+
+Spilling occurs when a Spark operation writes intermediate data from memory to disk because it cannot efficiently keep all its working data in memory.
+
+Operations such as sorting, aggregating, and joining may create temporary data structures that grow too large for the available execution memory.
+
+### What spilling is—and isn't
+
+It is not: A partition is too large, so Spark automatically moves the entire partition to disk.
+
+It is: An operation writes some of its intermediate working data to disk, frees up memory, and continues processing the remaining data.
+
+For example, during a sort, Spark can sort manageable chunks of data in memory, write sorted chunks to disk, and merge them later.
+
+The disk acts as a slower workspace for certain intermediate data, allowing Spark to process datasets that exceed available memory.
+
+## Data Spill Example
+
+Imagine Spark must sort 5 GB of data using `orderBy("age")`.
+
+The amount of execution memory available affects how much data Spark can process in memory before spilling.
+
+![alt text](../images/SparkSorting5GBData.png)
+
+These bars are conceptual, not measured spill volumes. Even with 5 GB of available memory, Spark may still need additional working space, and the operation's memory requirements depend on its implementation and data representation.
+
+### Why is spilling bad?
+
+Disk operations generally have higher latency and lower throughput than memory operations. Spilling can therefore increase execution time because Spark must write intermediate data to disk and potentially read it back later.
+
+Key principle: Spilling trades memory usage for execution time. It can be a useful mechanism that prevents memory exhaustion, but excessive spilling can make a job significantly slower.
+
+## How Data Skew Makes Spilling Worse
+
+Data skew occurs when partitions contain significantly different amounts of data or require very different amounts of processing.
+
+Consider 100 partitions:
+
+- 99 partitions contain 100 MB each.
+- 1 partition contains 5 GB.
+
+The 99 smaller partitions may finish quickly, while the 5 GB partition takes much longer and may spill heavily.
+
+![alt text](../images/SparkUnevenPartitionSizes.png) 
+
+Even if the cluster has many executors and plenty of aggregate memory, the task processing the oversized partition may become a bottleneck. Memory from other executors is not automatically pooled into that task's executor.
+
+Data skew can therefore cause:
+
+- Excessive spilling in a few tasks.
+- Long-running tasks that delay the entire stage.
+- Uneven CPU and memory utilization.
+- Out-of-memory errors in severe cases.
+
+## How Do You Reduce Spilling?
+
+The main goal is to reduce the working memory each task needs or provide more usable execution memory.
+
+### 1. Increase the number of partitions
+
+More partitions can reduce the amount of data processed by each task, provided the data is distributed reasonably evenly.
+
+```python
+df = df.repartition(200)
+```
+
+This example repartitions the DataFrame into 200 partitions.
+
+Trade-off: Too many partitions can introduce scheduling overhead and additional shuffle costs. Repartitioning itself may also require a shuffle.
+
+### 2. Increase available memory
+
+Give the executor more memory or adjust resource allocation when the workload genuinely needs more memory.
+
+For example, review:
+
+- `spark.executor.memory`
+- Executor cores and concurrent task count.
+- Memory overhead and container limits.
+- Execution and storage memory pressure.
+
+More executor memory does not guarantee less spilling if the workload is skewed or other resource constraints remain.
+
+### 3. Fix data skew
+
+Redistribute work so that one task does not process dramatically more data than the others.
+
+Potential techniques include:
+
+- Repartitioning using an appropriate key.
+- Using Adaptive Query Execution (AQE) and skew-join optimization.
+- Salting heavily skewed keys when appropriate.
+- Broadcasting a genuinely small DataFrame to avoid a large shuffle join.
+
+Simply increasing the partition count may not fix skew if the same oversized key remains concentrated in one partition.
+
+### 4. Process less data
+
+Reduce the amount of data that reaches expensive operations.
+
+For example:
+
+```python
+filtered = (
+    df.filter("age > 25")
+      .select("customer_id", "city", "age")
+)
+```
+
+Filtering unnecessary rows and selecting only required columns before joins, aggregations, or sorts can reduce data volume and memory pressure.
+
+Key takeaway: When investigating spilling, first identify the operation and tasks responsible. Then determine whether the cause is insufficient memory, oversized partitions, data skew, or unnecessary data processing before choosing a solution.
